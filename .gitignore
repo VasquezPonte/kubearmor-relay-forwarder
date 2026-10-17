@@ -1,0 +1,23 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Build artifacts
+/bin/
+/build/
+/dist/
+*.test
+*.out
+
+# Editors
+/.buildpath
+/.project
+/.settings/
+.vscode/
+.idea/
+
+# Logs and OS files
+*.log
+.DS_Store
+Thumbs.db
