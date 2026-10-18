@@ -13,6 +13,8 @@ import (
 	"time"
 )
 
+const healthShutdownTimeout = 5 * time.Second
+
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.LUTC | log.Lmicroseconds)
 
@@ -37,25 +39,11 @@ func main() {
 	}
 
 	healthServer := newHealthServer(cfg.HealthAddr, &relayReady)
-	healthErr := make(chan error, 1)
-	go func() {
-		if err := healthServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("health server failed: %v", err)
-			healthErr <- err
-			stop()
-		}
-	}()
+	healthErr := serveHealth(healthServer, stop)
 
 	var workers sync.WaitGroup
-	workers.Add(2)
-	go func() {
-		defer workers.Done()
-		spool.RunWorker(ctx, deliverer)
-	}()
-	go func() {
-		defer workers.Done()
-		WatchAlerts(ctx, cfg, spool, &relayReady)
-	}()
+	goTracked(&workers, func() { spool.RunWorker(ctx, deliverer) })
+	goTracked(&workers, func() { WatchAlerts(ctx, cfg, spool, &relayReady) })
 
 	select {
 	case <-ctx.Done():
@@ -64,12 +52,39 @@ func main() {
 	}
 	relayReady.Store(false)
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := healthServer.Shutdown(shutdownCtx); err != nil {
-		log.Printf("health server shutdown error: %v", err)
-	}
+	shutdownHealthServer(healthServer)
 
 	workers.Wait()
 	log.Printf("forwarder stopped")
+}
+
+// serveHealth runs srv in the background. If it fails, the error is sent on the
+// returned channel and stop is called to begin shutdown.
+func serveHealth(srv *http.Server, stop context.CancelFunc) <-chan error {
+	errCh := make(chan error, 1)
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("health server failed: %v", err)
+			errCh <- err
+			stop()
+		}
+	}()
+	return errCh
+}
+
+func shutdownHealthServer(srv *http.Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), healthShutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("health server shutdown error: %v", err)
+	}
+}
+
+// goTracked runs fn in a new goroutine that is tracked by wg.
+func goTracked(wg *sync.WaitGroup, fn func()) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		fn()
+	}()
 }

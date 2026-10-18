@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -37,56 +38,77 @@ func loadConfig() (Config, error) {
 
 	maxItems, err := strconv.Atoi(env("MAX_SPOOL_EVENTS", "20000"))
 	if err != nil || maxItems < 1 {
-		return Config{}, fmt.Errorf("MAX_SPOOL_EVENTS must be a positive integer")
+		return Config{}, errors.New("MAX_SPOOL_EVENTS must be a positive integer")
 	}
 	cfg.MaxSpoolItems = maxItems
 
-	if cfg.RelayAddr == "" {
-		return Config{}, fmt.Errorf("RELAY_ADDR cannot be empty")
-	}
-	if cfg.HealthAddr == "" {
-		return Config{}, fmt.Errorf("HEALTH_ADDR cannot be empty")
-	}
-	if strings.TrimSpace(cfg.APIKey) == "" {
-		return Config{}, fmt.Errorf("API_KEY must be set through a Kubernetes Secret")
-	}
-	if strings.ContainsAny(cfg.APIKey, "\r\n") {
-		return Config{}, fmt.Errorf("API_KEY must not contain newline characters")
-	}
-	if strings.ContainsAny(cfg.APIKeyPrefix, "\r\n") {
-		return Config{}, fmt.Errorf("API_KEY_PREFIX must not contain newline characters")
-	}
-	if cfg.APIKeyHeader == "" {
-		return Config{}, fmt.Errorf("API_KEY_HEADER cannot be empty")
-	}
-	if !validHeaderName(cfg.APIKeyHeader) {
-		return Config{}, fmt.Errorf("API_KEY_HEADER must be a valid HTTP header name")
-	}
-	if cfg.APIURL == "" {
-		return Config{}, fmt.Errorf("API_URL must be set to the destination API's absolute HTTP(S) URL")
+	if err := cfg.validate(); err != nil {
+		return Config{}, err
 	}
 
-	u, err := url.Parse(cfg.APIURL)
-	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
-		return Config{}, fmt.Errorf("API_URL must be an absolute HTTP(S) URL")
+	customFields, err := parseCustomFields()
+	if err != nil {
+		return Config{}, err
 	}
-	if u.Scheme != "https" && env("ALLOW_INSECURE_API_HTTP", "false") != "true" {
-		return Config{}, fmt.Errorf("API_URL must use HTTPS (set ALLOW_INSECURE_API_HTTP=true only for controlled testing)")
-	}
-
-	raw := env("CUSTOM_FIELDS_JSON", `{"managedBy":"flux"}`)
-	if strings.TrimSpace(raw) != "" {
-		if err := json.Unmarshal([]byte(raw), &cfg.CustomFields); err != nil {
-			return Config{}, fmt.Errorf("CUSTOM_FIELDS_JSON must be a JSON object: %w", err)
-		}
-		if cfg.CustomFields == nil {
-			return Config{}, fmt.Errorf("CUSTOM_FIELDS_JSON must be a JSON object, not null")
-		}
-	}
+	cfg.CustomFields = customFields
 
 	return cfg, nil
 }
 
+// validate checks the string settings in the order they are reported to the user.
+func (c Config) validate() error {
+	switch {
+		case c.RelayAddr == "":
+			return errors.New("RELAY_ADDR cannot be empty")
+		case c.HealthAddr == "":
+			return errors.New("HEALTH_ADDR cannot be empty")
+		case strings.TrimSpace(c.APIKey) == "":
+			return errors.New("API_KEY must be set through a Kubernetes Secret")
+		case strings.ContainsAny(c.APIKey, "\r\n"):
+			return errors.New("API_KEY must not contain newline characters")
+		case strings.ContainsAny(c.APIKeyPrefix, "\r\n"):
+			return errors.New("API_KEY_PREFIX must not contain newline characters")
+		case c.APIKeyHeader == "":
+			return errors.New("API_KEY_HEADER cannot be empty")
+		case !validHeaderName(c.APIKeyHeader):
+			return errors.New("API_KEY_HEADER must be a valid HTTP header name")
+	}
+	return validateAPIURL(c.APIURL)
+}
+
+func validateAPIURL(rawURL string) error {
+	if rawURL == "" {
+		return errors.New("API_URL must be set to the destination API's absolute HTTP(S) URL")
+	}
+
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
+		return errors.New("API_URL must be an absolute HTTP(S) URL")
+	}
+	if u.Scheme != "https" && env("ALLOW_INSECURE_API_HTTP", "false") != "true" {
+		return errors.New("API_URL must use HTTPS (set ALLOW_INSECURE_API_HTTP=true only for controlled testing)")
+	}
+	return nil
+}
+
+// parseCustomFields reads CUSTOM_FIELDS_JSON. A blank value yields no custom fields.
+func parseCustomFields() (map[string]any, error) {
+	raw := env("CUSTOM_FIELDS_JSON", `{"managedBy":"flux"}`)
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+
+	var fields map[string]any
+	if err := json.Unmarshal([]byte(raw), &fields); err != nil {
+		return nil, fmt.Errorf("CUSTOM_FIELDS_JSON must be a JSON object: %w", err)
+	}
+	if fields == nil {
+		return nil, errors.New("CUSTOM_FIELDS_JSON must be a JSON object, not null")
+	}
+	return fields, nil
+}
+
+// env returns the value of key if it is set (even if empty), otherwise fallback.
 func env(key, fallback string) string {
 	if value, ok := os.LookupEnv(key); ok {
 		return value
@@ -94,17 +116,22 @@ func env(key, fallback string) string {
 	return fallback
 }
 
+// validHeaderName reports whether name is a valid HTTP header field name (an RFC 7230 token).
 func validHeaderName(name string) bool {
 	if name == "" {
 		return false
 	}
 	for i := 0; i < len(name); i++ {
-		c := name[i]
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-			(c >= '0' && c <= '9') || strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c)) {
-			continue
+		if !isHeaderTokenChar(name[i]) {
+			return false
 		}
-		return false
 	}
 	return true
+}
+
+func isHeaderTokenChar(c byte) bool {
+	return (c >= 'a' && c <= 'z') ||
+		(c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9') ||
+		strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c))
 }

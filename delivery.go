@@ -10,6 +10,12 @@ import (
 	"time"
 )
 
+const (
+	userAgent         = "kubearmor-relay-forwarder/1.0.0"
+	maxErrorBodyBytes = 1024
+	maxDrainBodyBytes = 4096
+)
+
 // APIError describes a non-2xx response from the destination.
 type APIError struct {
 	StatusCode int
@@ -24,7 +30,8 @@ func (e *APIError) Error() string {
 // IsRetryable reports HTTP statuses that are normally transient.
 func (e *APIError) IsRetryable() bool {
 	return e.StatusCode == http.StatusRequestTimeout ||
-		e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
+		e.StatusCode == http.StatusTooManyRequests ||
+		e.StatusCode >= 500
 }
 
 // Deliverer posts encoded events to the configured API.
@@ -48,17 +55,12 @@ func newHTTPClient() *http.Client {
 	}
 }
 
+// Post sends body to the API. A non-2xx response is returned as an *APIError.
 func (d *Deliverer) Post(ctx context.Context, body []byte) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.Config.APIURL, bytes.NewReader(body))
+	req, err := d.newRequest(ctx, body)
 	if err != nil {
-		return fmt.Errorf("create API request: %w", err)
+		return err
 	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "kubearmor-relay-forwarder/1.0.0")
-	req.Header.Set("X-Security-Source", "kubearmor")
-	req.Header.Set(d.Config.APIKeyHeader, d.Config.APIKeyPrefix+d.Config.APIKey)
 
 	resp, err := d.Client.Do(req)
 	if err != nil {
@@ -67,7 +69,7 @@ func (d *Deliverer) Post(ctx context.Context, body []byte) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		message, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		message, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 		return &APIError{
 			StatusCode: resp.StatusCode,
 			Status:     resp.Status,
@@ -75,6 +77,21 @@ func (d *Deliverer) Post(ctx context.Context, body []byte) error {
 		}
 	}
 
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	// Drain a bounded amount of the body so the connection can be reused.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBodyBytes))
 	return nil
+}
+
+func (d *Deliverer) newRequest(ctx context.Context, body []byte) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.Config.APIURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create API request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("X-Security-Source", "kubearmor")
+	req.Header.Set(d.Config.APIKeyHeader, d.Config.APIKeyPrefix+d.Config.APIKey)
+	return req, nil
 }
