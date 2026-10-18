@@ -79,6 +79,7 @@ func (d *Deliverer) Post(ctx context.Context, body []byte) error {
 
 	// Drain a bounded amount of the body so the connection can be reused.
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBodyBytes))
+
 	return nil
 }
 
@@ -91,7 +92,12 @@ func (d *Deliverer) newRequest(ctx context.Context, body []byte) (*http.Request,
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("X-Security-Source", "kubearmor")
-	req.Header.Set(d.Config.APIKeyHeader, d.Config.APIKeyPrefix+d.Config.APIKey)
+
+	// Custom headers (WEBHOOK_CUSTOMHEADERS) are applied last, so they can
+	// also override the defaults above if configured to do so.
+	for name, value := range d.Config.CustomHeaders {
+		req.Header.Set(name, value)
+	}
+
 	return req, nil
 }
